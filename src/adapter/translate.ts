@@ -306,8 +306,21 @@ function toolResultPart(
   isError: boolean,
   content: readonly AgyBlockView[],
   toolNames: ToolNameIndex,
+  wireNames?: ReadonlyMap<string, string>,
 ): AgyPart {
-  const name = resolveToolName(toolNames, toolCallId) ?? toolCallId
+  // `resolveToolName` answers undefined only for an id no call was ever recorded
+  // under; that last resort stays the raw id, byte for byte (an id is not a
+  // function name, and rewriting it would not make it one).
+  const registered = resolveToolName(toolNames, toolCallId)
+  // DSH history carries the ORIGINAL tool name, but the model's functionCall
+  // used the wire name it was declared under, and a functionResponse must
+  // reference that same declared name. A name the map does not cover — the tool
+  // is no longer declared — still goes through `toWireToolName`, which is
+  // idempotent: replaying it reproduces the spelling the earlier turn sent
+  // rather than the raw registered name.
+  const name = registered === undefined
+    ? toolCallId
+    : (wireNames?.get(registered) ?? toWireToolName(registered))
   const text = content
     .filter((block): block is Extract<AgyBlockView, { type: 'text' }> => block.type === 'text')
     .map((block) => block.text)
@@ -331,6 +344,7 @@ function blockToParts(
   images: Map<string, AgyResolvedImage>,
   /** Claude path: replayed thought blocks are rejected outright (see below). */
   dropThoughts = false,
+  wireNames?: ReadonlyMap<string, string>,
 ): AgyPart[] {
   switch (block.type) {
     case 'text':
@@ -386,9 +400,14 @@ function blockToParts(
       // and a wrong change turns working parallel tool calls into 400s — so it
       // needs one real multi-tool turn measured before any edit.
       const signature = getThoughtSignature(block.id) ?? THOUGHT_SIGNATURE_SENTINEL
+      // DSH history names the tool by its ORIGINAL name (parse reverse-maps
+      // model calls); the upstream only knows the wire name it was declared
+      // under, so map it back before sending the call — and for a tool that is
+      // no longer declared, `toWireToolName` reproduces that same spelling.
+      const name = wireNames?.get(block.name) ?? toWireToolName(block.name)
       return [{
         thoughtSignature: signature,
-        functionCall: { id: block.id, name: block.name, args },
+        functionCall: { id: block.id, name, args },
       }]
     }
     case 'tool-result':
@@ -397,6 +416,7 @@ function blockToParts(
         block.isError === true,
         block.content,
         toolNames,
+        wireNames,
       )]
     case 'image': {
       // Bytes are pre-resolved by the adapter before translation; a missing
@@ -419,6 +439,7 @@ function messageToContent(
   multimodalFiles?: Map<string, AgyResolvedMultimodalFile[]>,
   messageIndex?: number,
   dropThoughts = false,
+  wireNames?: ReadonlyMap<string, string>,
 ): AgyContent | null {
   // 0.2.0 promotes a tool result to a `tool`-ROLE message, with the correlation
   // (`toolCallId`/`isError`) on the message instead of on a `tool-result` block.
@@ -432,7 +453,7 @@ function messageToContent(
     }
     return {
       role: 'user',
-      parts: [toolResultPart(message.toolCallId, message.isError === true, message.content, toolNames)],
+      parts: [toolResultPart(message.toolCallId, message.isError === true, message.content, toolNames, wireNames)],
     }
   }
 
@@ -442,7 +463,7 @@ function messageToContent(
     // unresolved-map guard, which protects only the user-image invariant.
     block.type === 'image' && message.role !== 'user'
       ? []
-      : blockToParts(block, toolNames, images, dropThoughts),
+      : blockToParts(block, toolNames, images, dropThoughts, wireNames),
   )
 
   if (message.role === 'user' && multimodalFiles) {
@@ -557,34 +578,82 @@ export const AGY_CLAUDE_MAX_OUTPUT_TOKENS = 64_000
 /** Upstream functionDeclarations names are `[a-zA-Z0-9_]` and ≤64 chars (OmniRoute-verified). */
 const AGY_TOOL_NAME_MAX_LENGTH = 64
 
-/** Sanitize a tool name to the upstream charset/length; dedupe via a short hash. */
-function sanitizeToolName(name: string, seen: Set<string>): string {
-  let candidate = name.replace(/[^a-zA-Z0-9_]/g, '_') || 'tool'
-  if (candidate.length > AGY_TOOL_NAME_MAX_LENGTH || seen.has(candidate)) {
-    const hash = createHash('sha256').update(candidate).digest('hex').slice(0, 8)
-    const prefix = candidate.slice(0, AGY_TOOL_NAME_MAX_LENGTH - hash.length - 1)
-    candidate = `${prefix}_${hash}`
-    let i = 2
-    while (seen.has(candidate)) candidate = `${prefix}_${i++}_${hash}`
-  }
-  seen.add(candidate)
-  return candidate
+/**
+ * The wire name for one registered tool name — a PURE function of that name.
+ *
+ * Deliberately independent of the batch a tool happens to be declared in: a name
+ * that needed rewriting always carries its hash tail, so a tool maps to the same
+ * wire name whatever else is declared beside it. History replay therefore
+ * reproduces the spelling an earlier turn sent, byte for byte, without
+ * remembering anything across turns — and this channel's implicit cache is keyed
+ * on prefix content, so rewriting a historical block would invalidate the whole
+ * cached suffix behind it (`docs/ANTIGRAVITY-API.md`).
+ *
+ * The hash covers the ORIGINAL name, never the rewritten candidate: `a-b` and
+ * `a.b` both rewrite to `a_b`, so hashing the candidate would give them the same
+ * tail and leave two tools sharing one wire name.
+ *
+ * Idempotent by construction — anything this function returns is already
+ * conforming and ≤64 chars, so it maps to itself. A name that is already
+ * wire-shaped (history recorded before this mapping existed, a tool that is no
+ * longer declared) therefore replays untouched.
+ */
+export function toWireToolName(name: string): string {
+  if (/^[a-zA-Z0-9_]+$/.test(name) && name.length <= AGY_TOOL_NAME_MAX_LENGTH) return name
+  const candidate = name.replace(/[^a-zA-Z0-9_]/g, '_') || 'tool'
+  const hash = createHash('sha256').update(name).digest('hex').slice(0, 8)
+  return `${candidate.slice(0, AGY_TOOL_NAME_MAX_LENGTH - hash.length - 1)}_${hash}`
 }
 
-function toolsToDeclarations(tools: ToolSchema[] | undefined): AgyRequestBody['request']['tools'] {
-  if (!tools || tools.length === 0) return undefined
-  const seenNames = new Set<string>()
-  const declarations = []
-  for (const tool of tools) {
+/**
+ * The request's whole tool surface, built in ONE pass: the declarations block
+ * plus both directions of the wire-name mapping.
+ *
+ * One build serves the request body (declarations), outbound history replay
+ * (`byRegisteredName`) and the inbound reverse mapping (`byWireName`), so the two
+ * directions cannot disagree — they are one computation read twice. The adapter
+ * builds it once per call and hands the same object to both consumers.
+ */
+export interface AgyToolSurface {
+  declarations: AgyRequestBody['request']['tools']
+  /** sanitized (wire) name -> original (DSH) name. */
+  byWireName: Map<string, string>
+  /** original (DSH) name -> sanitized (wire) name. */
+  byRegisteredName: Map<string, string>
+}
+
+export function buildToolSurface(tools: ToolSchema[] | undefined): AgyToolSurface {
+  const declarations: Array<{ name: string; description: string; parameters: unknown }> = []
+  const byWireName = new Map<string, string>()
+  const byRegisteredName = new Map<string, string>()
+  for (const tool of tools ?? []) {
     if (AGY_BUILTIN_TOOL_NAMES.has(tool.name)) continue
+    const wire = toWireToolName(tool.name)
     declarations.push({
-      name: sanitizeToolName(tool.name, seenNames),
+      name: wire,
       description: tool.description,
       parameters: sanitizeToolSchema(tool.parameters),
     })
+    byWireName.set(wire, tool.name)
+    byRegisteredName.set(tool.name, wire)
   }
-  if (declarations.length === 0) return undefined
-  return [{ functionDeclarations: declarations }]
+  return {
+    declarations: declarations.length === 0 ? undefined : [{ functionDeclarations: declarations }],
+    byWireName,
+    byRegisteredName,
+  }
+}
+
+/**
+ * Reverse mapping for tool names the model calls back: the backend only echoes
+ * the sanitized `[a-zA-Z0-9_]` name it was declared, but DSH registered the
+ * tool under its ORIGINAL name (MCP names are arbitrary, e.g.
+ * `mcp__context7__resolve-library-id`). Without this, DSH rejects the call as an
+ * unknown tool. `toWireToolName` is a pure function of the registered name, so
+ * this map always matches what `toAgyRequestBody` declared on the same request.
+ */
+export function buildToolNameMap(tools: ToolSchema[] | undefined): Map<string, string> {
+  return buildToolSurface(tools).byWireName
 }
 
 /** Build the wrapped Antigravity request body for one call. */
@@ -632,6 +701,14 @@ export function toAgyRequestBody(
      * `thinkingLevel` — the tiered model's adaptive entry, given an explicit cap.
      */
     tieredBudgetFor?: () => number | undefined
+    /**
+     * The tool surface for this request, when the caller already built one.
+     *
+     * The adapter builds it once per call and hands the SAME object to the SSE
+     * parser, so the declarations sent and the reverse map applied inbound are
+     * one computation rather than two that must agree.
+     */
+    toolSurface?: AgyToolSurface
   },
 ): AgyRequestBody {
   const messages = normalizeMessages(options.messages)
@@ -639,9 +716,15 @@ export function toAgyRequestBody(
   const images = context.images ?? new Map<string, AgyResolvedImage>()
   const multimodalFiles = supportsMultimodalFiles(options.model) ? context.multimodalFiles : undefined
   const claude = isClaudeModel(options.model)
+  // DSH history carries ORIGINAL tool names (parse reverse-maps model calls),
+  // but every name the upstream sees must be the wire name it was declared
+  // under. One build of the surface supplies both that inversion and the
+  // declarations below.
+  const surface = context.toolSurface ?? buildToolSurface(options.tools)
+  const wireNames = surface.byRegisteredName
   let contents = coalesceContents(
     conversationMessages(messages)
-      .map((message, index) => messageToContent(message, toolNames, images, multimodalFiles, index, claude))
+      .map((message, index) => messageToContent(message, toolNames, images, multimodalFiles, index, claude, wireNames))
       .filter((c): c is AgyContent => c !== null),
   )
   if (claude) {
@@ -657,7 +740,7 @@ export function toAgyRequestBody(
     .filter((text): text is string => typeof text === 'string' && text !== '')
     .join('\n\n')
 
-  const tools = toolsToDeclarations(options.tools)
+  const tools = surface.declarations
   const generationConfig: NonNullable<AgyRequestBody['request']['generationConfig']> = {}
   if (options.temperature !== undefined) generationConfig.temperature = options.temperature
   if (options.maxTokens !== undefined) {

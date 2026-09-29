@@ -235,6 +235,14 @@ async function readWithIdleTimeout(
 export interface ParseAgySseOptions {
   signal?: AbortSignal
   /**
+   * Reverse mapping for tool names the model calls back: sanitized (wire)
+   * name -> original (DSH) name. The backend only echoes the sanitized
+   * `[a-zA-Z0-9_]` name it was declared, but DSH registered the tool under its
+   * original name (e.g. `mcp__context7__resolve-library-id`) — without
+   * remapping, DSH rejects the call as an unknown tool. See translate.ts `buildToolNameMap`.
+   */
+  toolNames?: ReadonlyMap<string, string>
+  /**
    * Milliseconds of silence on the body before the read is abandoned. Defaults
    * to `resolveStreamIdleTimeoutMs()`; 0 disables the watchdog.
    */
@@ -395,6 +403,12 @@ export async function* parseAgySse(
           // Use the upstream functionCall id when present so the signature
           // captured on this part can be replayed for the same id next turn.
           const upstreamId = part.functionCall.id || String(blockIndex)
+          // The upstream echoes the sanitized wire name it was declared;
+          // hand DSH the original registered name so it can execute the tool
+          // (unknown names pass through untouched — the map only covers
+          // tools declared on this request).
+          const wireName = part.functionCall.name
+          const dshName = wireName === undefined ? undefined : (options.toolNames?.get(wireName) ?? wireName)
           // Each functionCall part is an ATOMIC block: a stream can carry
           // several functionCall parts in one turn (multi-tool responses),
           // and they share kind "tool-call" — ensureBlock alone would not
@@ -406,7 +420,7 @@ export async function* parseAgySse(
           }
           const start = ensureBlock('tool-call', {
             id: upstreamId,
-            name: part.functionCall.name,
+            name: dshName,
           })
           out.push(...start)
           if (part.thoughtSignature) {

@@ -3,7 +3,7 @@ import path from 'node:path'
 import fs from 'node:fs'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { GenerateOptions, Message } from '@deepseek-ai/dsh-llm'
-import { AGY_CLAUDE_MAX_OUTPUT_TOKENS, AGY_SCHEMA_ALLOWLIST, toAgyRequestBody } from '../src/adapter/translate.ts'
+import { AGY_CLAUDE_MAX_OUTPUT_TOKENS, AGY_SCHEMA_ALLOWLIST, buildToolNameMap, buildToolSurface, toAgyRequestBody, toWireToolName } from '../src/adapter/translate.ts'
 import {
   DEFAULT_STREAM_IDLE_TIMEOUT_MS,
   parseAgySse,
@@ -971,12 +971,12 @@ describe('translate', () => {
     expect(p.properties.nested_tuple!.items).toEqual({ type: 'string' })
   })
 
-  it('sanitizes tool names to the upstream charset and dedupes', () => {
+  it('rewrites tool names to the upstream charset, with a tail, and stays injective', () => {
     const body = toAgyRequestBody(
       generateOptions({
         tools: [
           { name: 'mcp__github__issue_write', description: 'd', parameters: { type: 'object', properties: {} } },
-          // illegal chars -> underscores; overlong -> hashed tail
+          // illegal chars -> underscores + hash tail; overlong -> truncated + hash tail
           { name: 'my tool.with/slashes!', description: 'd', parameters: { type: 'object', properties: {} } },
           { name: 'x'.repeat(120), description: 'd', parameters: { type: 'object', properties: {} } },
         ],
@@ -985,18 +985,124 @@ describe('translate', () => {
     )
     const names = body.request.tools![0].functionDeclarations.map((t) => t.name)
     expect(names[0]).toBe('mcp__github__issue_write')
-    expect(names[1]).toMatch(/^my_tool_with_slashes_$/)
+    expect(names[1]).toBe(toWireToolName('my tool.with/slashes!'))
+    expect(names[1]).toMatch(/^my_tool_with_slashes__[0-9a-f]{8}$/)
+    expect(names[2]).toBe(toWireToolName('x'.repeat(120)))
     expect(names[2]!.length).toBeLessThanOrEqual(64)
     expect(new Set(names).size).toBe(names.length)
+  })
+
+  it('names a tool by its registered name alone, whatever else is declared beside it', () => {
+    // The wire name is a pure function of the registered name: the batch a tool
+    // is declared in must not change its spelling, because a historical
+    // functionCall is replayed from that spelling and this channel's implicit
+    // cache is keyed on prefix content.
+    const alone = toWireToolName('mcp__srv__do.thing')
+    const withSibling = buildToolSurface([
+      { name: 'mcp__srv__do-thing', description: 'd', parameters: { type: 'object', properties: {} } },
+      { name: 'mcp__srv__do.thing', description: 'd', parameters: { type: 'object', properties: {} } },
+    ]).byRegisteredName.get('mcp__srv__do.thing')
+    // `a-b` and `a.b` both rewrite to `a_b`, so the hash must cover the ORIGINAL
+    // name — hashing the candidate would give both tools one wire name.
+    expect(alone).toMatch(/_do_thing_[0-9a-f]{8}$/)
+    expect(withSibling).toBe(alone)
+    expect(toWireToolName('mcp__srv__do-thing')).not.toBe(alone)
+    // ...and a conforming name is left exactly as it is.
+    expect(toWireToolName('bash')).toBe('bash')
+    expect(toWireToolName('mcp__github__issue_write')).toBe('mcp__github__issue_write')
+  })
+
+  it('is idempotent, so an already-wire-shaped history name replays untouched', () => {
+    const wire = toWireToolName('mcp__context7__resolve-library-id')
+    expect(toWireToolName(wire)).toBe(wire)
+    // A tool that is no longer declared falls through the map; replaying it must
+    // still reproduce the spelling the earlier turn sent, not the raw name.
+    const messages = [
+      { id: 'a', role: 'assistant' as const, content: [
+        { type: 'tool-call' as const, id: 'call-1', name: 'mcp__context7__resolve-library-id', arguments: '{}' },
+      ]},
+      { id: 'b', role: 'user' as const, content: [
+        { type: 'tool-result' as const, toolCallId: 'call-1', content: [{ type: 'text', text: 'ok' }] },
+      ]},
+    ]
+    const body = toAgyRequestBody(generateOptions({ tools: [], messages }), {})
+    const parts = body.request.contents.flatMap((c) => c.parts)
+    expect(parts).toContainEqual(expect.objectContaining({
+      functionCall: { id: 'call-1', name: wire, args: {} },
+    }))
+    expect(parts).toContainEqual(expect.objectContaining({
+      functionResponse: expect.objectContaining({ name: wire }),
+    }))
+  })
+
+  it('buildToolNameMap maps sanitized wire names back to original DSH names', () => {
+    const map = buildToolNameMap([
+      { name: 'mcp__context7__resolve-library-id', description: 'd', parameters: { type: 'object', properties: {} } },
+      { name: 'mcp__context7__query-docs', description: 'd', parameters: { type: 'object', properties: {} } },
+    ])
+    expect(map.get(toWireToolName('mcp__context7__resolve-library-id'))).toBe('mcp__context7__resolve-library-id')
+    expect(map.get(toWireToolName('mcp__context7__query-docs'))).toBe('mcp__context7__query-docs')
+    expect(buildToolNameMap(undefined).size).toBe(0)
+  })
+
+  it('re-applies sanitized wire names to outbound history tool-calls and tool-results', () => {
+    // DSH history carries ORIGINAL names (the parser reverse-maps model calls);
+    // the upstream only knows the sanitized name it was declared, so the
+    // outbound functionCall/functionResponse must use the wire name.
+    const messages = [
+      { id: 'a', role: 'assistant' as const, content: [
+        { type: 'tool-call' as const, id: 'call-1', name: 'mcp__context7__resolve-library-id', arguments: '{"libraryId":"/reactjs/react.dev"}' },
+      ]},
+      { id: 'b', role: 'user' as const, content: [
+        { type: 'tool-result' as const, toolCallId: 'call-1', content: [{ type: 'text', text: 'ok' }] },
+      ]},
+    ]
+    const body = toAgyRequestBody(
+      generateOptions({
+        tools: [
+          { name: 'mcp__context7__resolve-library-id', description: 'd', parameters: { type: 'object', properties: {} } },
+        ],
+        messages,
+      }),
+      {},
+    )
+    const wire = toWireToolName('mcp__context7__resolve-library-id')
+    const parts = body.request.contents.flatMap((c) => c.parts)
+    expect(parts).toContainEqual(expect.objectContaining({
+      functionCall: { id: 'call-1', name: wire, args: { libraryId: '/reactjs/react.dev' } },
+    }))
+    expect(parts).toContainEqual(expect.objectContaining({
+      functionResponse: expect.objectContaining({ name: wire, response: { result: 'ok', is_error: false } }),
+    }))
+  })
+
+  it('leaves already-conforming history tool names untouched on the wire', () => {
+    const messages = [
+      { id: 'a', role: 'assistant' as const, content: [
+        { type: 'tool-call' as const, id: 'call-1', name: 'bash', arguments: '{"cmd":"ls"}' },
+      ]},
+      { id: 'b', role: 'user' as const, content: [
+        { type: 'tool-result' as const, toolCallId: 'call-1', content: [{ type: 'text', text: '' }] },
+      ]},
+    ]
+    const body = toAgyRequestBody(
+      generateOptions({
+        tools: [{ name: 'bash', description: 'd', parameters: { type: 'object' } }],
+        messages,
+      }),
+      {},
+    )
+    const parts = body.request.contents.flatMap((c) => c.parts)
+    expect(parts).toContainEqual(expect.objectContaining({ functionCall: { id: 'call-1', name: 'bash', args: { cmd: 'ls' } } }))
   })
 
   it('excludes builtin Gemini tool names from functionDeclarations', () => {
     const body = toAgyRequestBody(
       generateOptions({
         tools: [
-          { name: 'web_search', description: 'd', parameters: { type: 'object', properties: {} } },
-          { name: 'google_search', description: 'd', parameters: { type: 'object', properties: {} } },
-          { name: 'mcp__github__issue_write', description: 'd', parameters: { type: 'object', properties: {} } },
+          { name: 'web_search', description: 'd', parameters: { type: 'object' } },
+          { name: 'google_search', description: 'd', parameters: { type: 'object' } },
+          { name: 'mcp__github__issue_write', description: 'd', parameters: { type: 'object' } },
         ],
       }),
       {},
@@ -1168,6 +1274,41 @@ describe('parseAgySse', () => {
     expect(chunks[0]).toMatchObject({ type: 'block-start', blockType: 'tool-call' })
     expect(chunks[1]).toMatchObject({ type: 'tool-call-delta', name: 'web_search' })
     expect(chunks[2]).toMatchObject({ type: 'block-end', block: { type: 'tool-call', name: 'web_search', arguments: '{"q":"x"}' } })
+  })
+
+  it('reverse-maps sanitized wire tool names to the registered DSH names', async () => {
+    // The upstream echoes the sanitized name it was declared; DSH registered
+    // the original MCP name. Without remapping DSH would reject the call as
+    // an unknown tool — the Context7 reproduction.
+    const toolNames = new Map([
+      ['mcp__context7__resolve_library_id', 'mcp__context7__resolve-library-id'],
+    ])
+    const chunks = await collect(parseAgySse(sseStream([
+      'data: [{"candidates":[{"content":{"parts":[{"functionCall":{"id":"c1","name":"mcp__context7__resolve_library_id","args":{"libraryId":"/reactjs/react.dev"}}}]}}]}]',
+      'data: [DONE]',
+    ]), { toolNames }))
+    const toolCalls = chunks.filter((c) => (c as { type: string }).type === 'block-end' && (c as { block: { type: string } }).block.type === 'tool-call')
+    expect(toolCalls).toHaveLength(1)
+    expect(toolCalls[0]).toMatchObject({
+      block: { type: 'tool-call', id: 'c1', name: 'mcp__context7__resolve-library-id', arguments: '{"libraryId":"/reactjs/react.dev"}' },
+    })
+  })
+
+  it('passes unknown tool names through untouched without a mapping', async () => {
+    // No toolNames map (e.g. the standalone CLI verify path) or a name not in
+    // the map must preserve the upstream name verbatim.
+    const chunks = await collect(parseAgySse(sseStream([
+      'data: [{"candidates":[{"content":{"parts":[{"functionCall":{"id":"c1","name":"some_unknown_tool","args":{}}}]}}]}]',
+      'data: [DONE]',
+    ])))
+    const end = chunks.find((c) => (c as { type: string }).type === 'block-end')
+    expect(end).toMatchObject({ block: { type: 'tool-call', id: 'c1', name: 'some_unknown_tool' } })
+    const mapped = await collect(parseAgySse(sseStream([
+      'data: [{"candidates":[{"content":{"parts":[{"functionCall":{"id":"c2","name":"not_declared","args":{}}}]}}]}]',
+      'data: [DONE]',
+    ]), { toolNames: new Map([['declared_wire', 'declared-original']]) }))
+    const end2 = mapped.find((c) => (c as { type: string }).type === 'block-end')
+    expect(end2).toMatchObject({ block: { type: 'tool-call', id: 'c2', name: 'not_declared' } })
   })
 
   it('isolates consecutive functionCall parts into separate atomic blocks', async () => {
@@ -2160,6 +2301,31 @@ describe('AgyAdapter', () => {
       for await (const _ of adapter.stream(generateOptions())) void _
     }).rejects.toMatchObject({ code: 'UPSTREAM' })
     expect(failures).toEqual(['request-error'])
+  })
+
+  it('hands DSH the original tool name for a sanitized upstream functionCall', async () => {
+    // Offline reproduction of the Context7 tool-name scenario (fetch is stubbed
+    // below — zero network): the upstream only echoes the wire name it was
+    // declared, but the tool is registered under its original hyphenated MCP
+    // name. The adapter must reverse-map before emitting the tool-call block,
+    // otherwise the harness fails with `unknown tool "mcp__context7__resolve_library_id"`.
+    const wire = toWireToolName('mcp__context7__resolve-library-id')
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(sseStream([
+      `data: [{"candidates":[{"content":{"parts":[{"functionCall":{"id":"c1","name":"${wire}","args":{"libraryId":"/reactjs/react.dev"}}}]},"finishReason":"TOOL_CALLS"}]}]`,
+      'data: [DONE]',
+    ]), { status: 200 })))
+    const adapter = new AgyAdapter({
+      getSession: async () => session(),
+      reportFailure: async () => {},
+    })
+    const chunks: unknown[] = []
+    for await (const chunk of adapter.stream(generateOptions({
+      tools: [{ name: 'mcp__context7__resolve-library-id', description: 'd', parameters: { type: 'object', properties: {} } }],
+    }))) chunks.push(chunk)
+    const end = chunks.find((c) => (c as { type: string }).type === 'block-end')
+    expect(end).toMatchObject({
+      block: { type: 'tool-call', id: 'c1', name: 'mcp__context7__resolve-library-id', arguments: '{"libraryId":"/reactjs/react.dev"}' },
+    })
   })
 
   it('retries a stream ending in MALFORMED_FUNCTION_CALL and yields the recovered attempt', async () => {

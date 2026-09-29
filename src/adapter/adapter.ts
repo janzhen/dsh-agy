@@ -38,7 +38,7 @@ import {
   generateAntigravityRequestId,
 } from '../runtime/identity.ts'
 import { setThoughtSignature } from '../runtime/signature-cache.ts'
-import { toAgyRequestBody } from './translate.ts'
+import { buildToolSurface, toAgyRequestBody } from './translate.ts'
 import type { AgyResolvedImage } from './translate.ts'
 import { resolveMultimodalFiles } from './multimodal.ts'
 import { AgyStreamIdleTimeoutError, parseAgySse, UnmappedFinishReasonError } from './parse.ts'
@@ -464,6 +464,12 @@ export class AgyAdapter extends LlmAdapter {
     // dispatcher drops the per-gap body timeout a reasoning pause would trip.
     const routing = { proxyUrl: session.account.proxy, streaming: true }
 
+    // One tool surface per CALL: the declarations the body carries and the
+    // reverse map the parser applies are the same build, and a re-sampled
+    // attempt (or an accumulation-wall resend) reuses it instead of walking
+    // every tool schema again.
+    const toolSurface = buildToolSurface(options.tools)
+
     /**
      * Send one request, resending at most once when the upstream reports the
      * per-`sessionId` accumulation wall.
@@ -502,6 +508,7 @@ export class AgyAdapter extends LlmAdapter {
             : { tieredBudgetFor: this.options.tieredBudgetFor }),
           ...(images.size > 0 ? { images } : {}),
           ...(multimodalFiles.size > 0 ? { multimodalFiles } : {}),
+          toolSurface,
         })
         let response: Response
         try {
@@ -697,6 +704,10 @@ export class AgyAdapter extends LlmAdapter {
       try {
         for await (const chunk of parseAgySse(response.body, {
           signal: options.signal,
+          // Reverse-map the wire tool names the model calls back to the original
+          // DSH names so the harness can execute them — the same surface the body
+          // was built from, so the two directions cannot disagree.
+          toolNames: toolSurface.byWireName,
           onToolSignature: (toolCallId, signature) => {
             pendingSignatures.push([toolCallId, signature])
           },
