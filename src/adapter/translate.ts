@@ -627,8 +627,10 @@ export function buildToolSurface(tools: ToolSchema[] | undefined): AgyToolSurfac
   const byWireName = new Map<string, string>()
   const byRegisteredName = new Map<string, string>()
   for (const tool of tools ?? []) {
-    if (AGY_BUILTIN_TOOL_NAMES.has(tool.name)) continue
-    const wire = toWireToolName(tool.name)
+    // Builtin Gemini tools (google_search, web_search, etc.) shadow native tools
+    // if declared under their raw names, so alias them with a `dsh_` prefix on the wire.
+    const baseName = AGY_BUILTIN_TOOL_NAMES.has(tool.name) ? `dsh_${tool.name}` : tool.name
+    const wire = toWireToolName(baseName)
     declarations.push({
       name: wire,
       description: tool.description,

@@ -1039,9 +1039,12 @@ describe('translate', () => {
     const map = buildToolNameMap([
       { name: 'mcp__context7__resolve-library-id', description: 'd', parameters: { type: 'object', properties: {} } },
       { name: 'mcp__context7__query-docs', description: 'd', parameters: { type: 'object', properties: {} } },
+      // builtin Gemini tools are aliased with dsh_ prefix on the wire
+      { name: 'web_search', description: 'd', parameters: { type: 'object', properties: {} } },
     ])
     expect(map.get(toWireToolName('mcp__context7__resolve-library-id'))).toBe('mcp__context7__resolve-library-id')
     expect(map.get(toWireToolName('mcp__context7__query-docs'))).toBe('mcp__context7__query-docs')
+    expect(map.get('dsh_web_search')).toBe('web_search')
     expect(buildToolNameMap(undefined).size).toBe(0)
   })
 
@@ -1052,15 +1055,18 @@ describe('translate', () => {
     const messages = [
       { id: 'a', role: 'assistant' as const, content: [
         { type: 'tool-call' as const, id: 'call-1', name: 'mcp__context7__resolve-library-id', arguments: '{"libraryId":"/reactjs/react.dev"}' },
+        { type: 'tool-call' as const, id: 'call-2', name: 'web_search', arguments: '{"queries":["react"]}' },
       ]},
       { id: 'b', role: 'user' as const, content: [
         { type: 'tool-result' as const, toolCallId: 'call-1', content: [{ type: 'text', text: 'ok' }] },
+        { type: 'tool-result' as const, toolCallId: 'call-2', content: [{ type: 'text', text: 'results' }] },
       ]},
     ]
     const body = toAgyRequestBody(
       generateOptions({
         tools: [
           { name: 'mcp__context7__resolve-library-id', description: 'd', parameters: { type: 'object', properties: {} } },
+          { name: 'web_search', description: 'd', parameters: { type: 'object', properties: {} } },
         ],
         messages,
       }),
@@ -1072,7 +1078,13 @@ describe('translate', () => {
       functionCall: { id: 'call-1', name: wire, args: { libraryId: '/reactjs/react.dev' } },
     }))
     expect(parts).toContainEqual(expect.objectContaining({
+      functionCall: { id: 'call-2', name: 'dsh_web_search', args: { queries: ['react'] } },
+    }))
+    expect(parts).toContainEqual(expect.objectContaining({
       functionResponse: expect.objectContaining({ name: wire, response: { result: 'ok', is_error: false } }),
+    }))
+    expect(parts).toContainEqual(expect.objectContaining({
+      functionResponse: expect.objectContaining({ name: 'dsh_web_search', response: { result: 'results', is_error: false } }),
     }))
   })
 
@@ -1096,26 +1108,23 @@ describe('translate', () => {
     expect(parts).toContainEqual(expect.objectContaining({ functionCall: { id: 'call-1', name: 'bash', args: { cmd: 'ls' } } }))
   })
 
-  it('excludes builtin Gemini tool names from functionDeclarations', () => {
+  it('aliases builtin Gemini tool names on the wire to prevent shadowing', () => {
     const body = toAgyRequestBody(
       generateOptions({
         tools: [
-          { name: 'web_search', description: 'd', parameters: { type: 'object' } },
-          { name: 'google_search', description: 'd', parameters: { type: 'object' } },
-          { name: 'mcp__github__issue_write', description: 'd', parameters: { type: 'object' } },
+          { name: 'web_search', description: 'd', parameters: { type: 'object', properties: {} } },
+          { name: 'google_search', description: 'd', parameters: { type: 'object', properties: {} } },
+          { name: 'mcp__github__issue_write', description: 'd', parameters: { type: 'object', properties: {} } },
         ],
       }),
       {},
     )
     const names = body.request.tools![0].functionDeclarations.map((t) => t.name)
-    expect(names).toEqual(['mcp__github__issue_write'])
+    expect(names).toEqual(['dsh_web_search', 'dsh_google_search', 'mcp__github__issue_write'])
   })
 
-  it('returns no tools block when all tools are builtin or sanitized away', () => {
-    const body = toAgyRequestBody(
-      generateOptions({ tools: [{ name: 'web_search', description: 'd', parameters: { type: 'object' } }] }),
-      {},
-    )
+  it('returns no tools block when tools list is empty or undefined', () => {
+    const body = toAgyRequestBody(generateOptions({ tools: [] }), {})
     expect(body.request.tools).toBeUndefined()
   })
 
@@ -2325,6 +2334,29 @@ describe('AgyAdapter', () => {
     const end = chunks.find((c) => (c as { type: string }).type === 'block-end')
     expect(end).toMatchObject({
       block: { type: 'tool-call', id: 'c1', name: 'mcp__context7__resolve-library-id', arguments: '{"libraryId":"/reactjs/react.dev"}' },
+    })
+  })
+
+  it('hands DSH the original web_search tool name for an aliased dsh_web_search upstream functionCall', async () => {
+    // Offline reproduction of Issue #68 (Route 1): web_search is aliased on the wire
+    // as dsh_web_search to prevent collision with Google's native Grounding tool.
+    // When the model calls dsh_web_search, the adapter reverse-maps it to web_search
+    // so DSH can dispatch to its local search seam (Exa/SearXNG/etc.).
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(sseStream([
+      'data: [{"candidates":[{"content":{"parts":[{"functionCall":{"id":"c1","name":"dsh_web_search","args":{"queries":["react 19"]}}}]},"finishReason":"TOOL_CALLS"}]}]',
+      'data: [DONE]',
+    ]), { status: 200 })))
+    const adapter = new AgyAdapter({
+      getSession: async () => session(),
+      reportFailure: async () => {},
+    })
+    const chunks: unknown[] = []
+    for await (const chunk of adapter.stream(generateOptions({
+      tools: [{ name: 'web_search', description: 'Search the web', parameters: { type: 'object', properties: {} } }],
+    }))) chunks.push(chunk)
+    const end = chunks.find((c) => (c as { type: string }).type === 'block-end')
+    expect(end).toMatchObject({
+      block: { type: 'tool-call', id: 'c1', name: 'web_search', arguments: '{"queries":["react 19"]}' },
     })
   })
 

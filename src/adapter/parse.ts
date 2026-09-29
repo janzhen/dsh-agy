@@ -235,11 +235,12 @@ async function readWithIdleTimeout(
 export interface ParseAgySseOptions {
   signal?: AbortSignal
   /**
-   * Reverse mapping for tool names the model calls back: sanitized (wire)
-   * name -> original (DSH) name. The backend only echoes the sanitized
-   * `[a-zA-Z0-9_]` name it was declared, but DSH registered the tool under its
-   * original name (e.g. `mcp__context7__resolve-library-id`) — without
-   * remapping, DSH rejects the call as an unknown tool. See translate.ts `buildToolNameMap`.
+   * Reverse mapping for tool names the model calls back: wire name -> original
+   * (DSH) name. The backend only echoes the `[a-zA-Z0-9_]` name a call was
+   * declared under, but DSH registered the tool under its original name (e.g.
+   * `mcp__context7__resolve-library-id`, or aliased `dsh_web_search` ->
+   * `web_search`) — without remapping, DSH rejects the call as an unknown tool.
+   * See translate.ts `buildToolSurface`.
    */
   toolNames?: ReadonlyMap<string, string>
   /**
